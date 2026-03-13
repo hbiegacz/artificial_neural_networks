@@ -1,0 +1,8 @@
+Zadanie polega na przewidywaniu liczby wypożyczonych rowerów/hulajnóg w danym mieście. Do dyspozycji mamy informacje historyczne na temat tego, ile pojazdów zostało wypożyczonych o danej godzinie danego dnia, jakie były wtedy warunki atmosferyczne, czy był to zwykły dzień pracy czy wolny itp. Interesuje mnie wartość ostatniej kolumny ze zbioru data.csv, czyli cnt - to jest sumaryczna liczba wypożyczeń. Dodatkowo ta suma jest rozbita na liczbę wypożyczeń użytkowników zarejestrowanych (registered) i niezarejestrowanych (casual). Jeżeli ktoś chce to może stworzyć osobny model per grupa użytkowników, co może poprawić wyniki. Na koniec proszę zwrócić sumaryczną liczbę wypożyczeń, czyli przewidywane registered + przewidywane casual lub przewidywane cnt.
+
+
+W ramach rozwiązania proszę oddać archiwum .zip z kodem (w formie notebooka, lub skryptu/skryptów .py) oraz plikiem csv z predykcjami na zbiorze evaluation_data.csv (proszę zwrócić uwagę, że nie ma tam wartości registered/casual/cnt). W ramach predykcji proszę zapisać przewidywaną wartość cnt (może to być wartość ciągła). Archiwum zwraca jedna osoba z grupy. 
+Końcowe wyniki obliczał będę w oparciu o błąd RMSLE - sposób ewaluacji z przykładowym plikiem csv w takiej formie, której oczekuję od Państwa (muchomorki.csv) znajduje się w pliku RMSLE Calculation.ipynb.
+Bardzo proszę nazywać wszystkie pliki nazwiskami autorów (najlepiej alfabetycznie), lub nazwą zespołu, nazwę plików prosze rozpocząć od przedrostka poniedzialek_ lub piatek_.
+
+Proszę upewnić się, że plik csv z predykcjami na pewno ma sens - czy jest tyle wartości ile wierszy w pliku ewaluacyjnym, czy nie ma dodatkowego nagłówka, dodatkowej kolumny z indeksem itp.
