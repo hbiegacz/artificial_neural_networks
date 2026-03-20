@@ -1,4 +1,4 @@
-from sklearn.preprocessing import StandardScaler, OrdinalEncoder
+from sklearn.preprocessing import StandardScaler
 from dataclasses import dataclass, field
 from typing import List, Optional
 import torch.nn as nn
@@ -11,10 +11,9 @@ AVERAGE_THRESHOLD = 350_000
 CAT_COLS = ["HallwayType", "HeatingType", "AptManageType",
             "TimeToBusStop", "TimeToSubway", "SubwayStation"]
 
-_enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
-
 # FUNCTIONS FOR LOADING & PRERPARING DATA 
 # (REMOVING WHITESPACE, CATEGORICAL DATA -> NUMERIC VALS, ADDING CHEAP/AVERAGE/EXPENSIVE LABELS TO TRAINING DATA)
+_train_columns: List[str] = [] 
 
 def load_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -33,15 +32,22 @@ def assign_house_labels(df: pd.DataFrame) -> np.ndarray:
         [0, 1], default=2
     )
 
+def encode_categorical_vals(df: pd.DataFrame) -> pd.DataFrame:
+    return pd.get_dummies(df, columns=CAT_COLS).astype(float)
+
 def prepare_train_data(path: str):
+    global _train_columns
     df = load_data(path)
-    df[CAT_COLS] = _enc.fit_transform(df[CAT_COLS])
-    return df.drop(columns=["SalePrice"]), assign_house_labels(df)
+    y = assign_house_labels(df)
+    df = encode_categorical_vals(df.drop(columns=["SalePrice"]))
+    _train_columns = df.columns.tolist() 
+    return df, y
 
 def prepare_test_data(path: str) -> pd.DataFrame:
     df = load_data(path)
-    df[CAT_COLS] = _enc.transform(df[CAT_COLS])
-    return df
+    df = encode_categorical_vals(df)
+    return df.reindex(columns=_train_columns, fill_value=0)
+
 
 # CONFIG CLASS (FOR EASY NETWORK DEFINITION DURING EXPERIMENTS)
 @dataclass
