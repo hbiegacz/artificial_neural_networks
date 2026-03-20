@@ -90,3 +90,9 @@ class NeuralNetwork:
             return None
         return torch.tensor(1.0 / np.bincount(y), dtype=torch.float32)
 
+if __name__ == "__main__":
+    X_train, y_train = prepare_train_data("train_data.csv")
+    X_test = prepare_test_data("test_data.csv")
+    model = NeuralNetwork(NetConfig(class_weight=True))
+    model.fit(X_train, y_train)
+    pd.DataFrame(model.predict(X_test)).to_csv("preds.csv", index=False, header=False)
