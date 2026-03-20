@@ -37,3 +37,13 @@ def prepare_test_data(path: str) -> pd.DataFrame:
     df = load_data(path)
     df[CAT_COLS] = _enc.transform(df[CAT_COLS])
     return df
+
+@dataclass
+class NetConfig:
+    layers:       List[int]      = field(default_factory=lambda: [128, 64])
+    dropout:      float          = 0.0
+    batch_norm:   bool           = False
+    sampler:      Optional[type] = None
+    class_weight: bool           = False
+    epochs:       int            = 100
+
