@@ -1,14 +1,20 @@
+from sklearn.preprocessing import StandardScaler, OrdinalEncoder
+from dataclasses import dataclass, field
+from typing import List, Optional
+import torch.nn as nn
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import OrdinalEncoder
+import torch
 
 CHEAP_THRESHOLD   = 100_000
 AVERAGE_THRESHOLD = 350_000
-
 CAT_COLS = ["HallwayType", "HeatingType", "AptManageType",
             "TimeToBusStop", "TimeToSubway", "SubwayStation"]
 
 _enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
+
+# FUNCTIONS FOR LOADING & PRERPARING DATA 
+# (REMOVING WHITESPACE, CATEGORICAL DATA -> NUMERIC VALS, ADDING CHEAP/AVERAGE/EXPENSIVE LABELS TO TRAINING DATA)
 
 def load_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -21,7 +27,7 @@ def strip_whitespace(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def assign_house_labels(df: pd.DataFrame) -> np.ndarray:
-    ''''Depending on SalePrice assigns label: cheap (0), average (1) or expensive (2)'''
+    """assigns label cheap (0), average (1) or expensive (2) based on SalePrice"""
     return np.select(
         [df["SalePrice"] <= CHEAP_THRESHOLD, df["SalePrice"] <= AVERAGE_THRESHOLD],
         [0, 1], default=2
@@ -30,14 +36,14 @@ def assign_house_labels(df: pd.DataFrame) -> np.ndarray:
 def prepare_train_data(path: str):
     df = load_data(path)
     df[CAT_COLS] = _enc.fit_transform(df[CAT_COLS])
-    y = assign_house_labels(df)
-    return df.drop(columns=["SalePrice"]), y
+    return df.drop(columns=["SalePrice"]), assign_house_labels(df)
 
 def prepare_test_data(path: str) -> pd.DataFrame:
     df = load_data(path)
     df[CAT_COLS] = _enc.transform(df[CAT_COLS])
     return df
 
+# CONFIG CLASS (FOR EASY NETWORK DEFINITION DURING EXPERIMENTS)
 @dataclass
 class NetConfig:
     layers:       List[int]      = field(default_factory=lambda: [128, 64])
@@ -47,6 +53,8 @@ class NetConfig:
     class_weight: bool           = False
     epochs:       int            = 100
 
+
+# NETWORK ITSELF 
 class NeuralNetwork:
     def __init__(self, config: NetConfig):
         self.config = config
@@ -90,6 +98,8 @@ class NeuralNetwork:
             return None
         return torch.tensor(1.0 / np.bincount(y), dtype=torch.float32)
 
+
+# CREATING & SAVING THE FINAL SOLUTION TO PREDS 
 if __name__ == "__main__":
     X_train, y_train = prepare_train_data("train_data.csv")
     X_test = prepare_test_data("test_data.csv")
