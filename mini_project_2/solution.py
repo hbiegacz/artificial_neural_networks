@@ -52,12 +52,17 @@ def prepare_test_data(path: str) -> pd.DataFrame:
 # CONFIG CLASS (FOR EASY NETWORK DEFINITION DURING EXPERIMENTS)
 @dataclass
 class NetConfig:
-    layers:       List[int]      = field(default_factory=lambda: [128, 64])
-    dropout:      float          = 0.0
-    batch_norm:   bool           = False
-    sampler:      Optional[type] = None
-    class_weight: bool           = False
-    epochs:       int            = 100
+    layers:       List[int]       = field(default_factory=lambda: [128, 64])
+    dropout:      List[float]     = field(default_factory=lambda: [0.0])
+    activation:   List[type]      = field(default_factory=lambda: [nn.ReLU])
+    batch_norm:   bool            = False
+    sampler:      Optional[type]  = None
+    class_weight: bool            = False
+    epochs:       int             = 100
+
+    def _expand(self, param: list, n: int) -> list:
+        """If single value given, repeat it for all n layers."""
+        return param * n if len(param) == 1 else param
 
 
 # NETWORK ITSELF 
@@ -87,17 +92,27 @@ class NeuralNetwork:
             return self.net(Xt).argmax(1).numpy()
 
     def _build_net(self, input_dim: int) -> nn.Sequential:
-        def block(in_f, out_f):
+        n = len(self.config.layers)
+        dropouts    = self.config._expand(self.config.dropout, n)
+        activations = self.config._expand(self.config.activation, n)
+
+        def block(in_f, out_f, drop, act):
             return [l for l in [
                 nn.Linear(in_f, out_f),
                 nn.BatchNorm1d(out_f) if self.config.batch_norm else None,
-                nn.ReLU(),
-                nn.Dropout(self.config.dropout) if self.config.dropout > 0 else None,
+                act(),
+                nn.Dropout(drop) if drop > 0 else None,
             ] if l is not None]
+
         dims = [input_dim] + self.config.layers
-        layers = [l for in_f, out_f in zip(dims, dims[1:]) for l in block(in_f, out_f)]
+        layers = [
+            l for (in_f, out_f), drop, act
+            in zip(zip(dims, dims[1:]), dropouts, activations)
+            for l in block(in_f, out_f, drop, act)
+        ]
         layers.append(nn.Linear(self.config.layers[-1], 3))
         return nn.Sequential(*layers)
+
 
     def _class_weights(self, y) -> Optional[torch.Tensor]:
         if not self.config.class_weight:
