@@ -124,6 +124,14 @@ class NeuralNetwork:
 if __name__ == "__main__":
     X_train, y_train = prepare_train_data("train_data.csv")
     X_test = prepare_test_data("test_data.csv")
-    model = NeuralNetwork(NetConfig(class_weight=True)) #TODO: Find best possible NetConfig
+    best_configuration = NetConfig(
+        class_weight=True, 
+        layers=[512, 128, 32],
+        dropout=[0.1, 0.2, 0.3],
+        batch_norm=False,
+        epochs=300
+    )
+    
+    model = NeuralNetwork(best_configuration)
     model.fit(X_train, y_train)
     pd.DataFrame(model.predict(X_test)).to_csv("pred.csv", index=False, header=False)
