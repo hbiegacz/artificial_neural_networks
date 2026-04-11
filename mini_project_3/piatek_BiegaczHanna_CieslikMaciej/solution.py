@@ -150,13 +150,27 @@ class NeuralNetwork:
                     
         return all_predictions
 
-def read_trainset(path: str = TRAINING_DATA_PATH):
-    training_transforms = transforms.Compose([
+def read_trainset(path: str = TRAINING_DATA_PATH, augmentation: str = 'none', img_size: int = IMG_SIZE):
+    common_transforms = [
         transforms.Resize((64, 64)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+    ]
+
+    # DATA AUGMENTATION
+    aug_transforms = []
+    if augmentation == 'weak':
+        aug_transforms = [transforms.RandomHorizontalFlip(p=0.5)]
+    elif augmentation == 'strong':
+        aug_transforms = [
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+            transforms.RandomRotation(degrees=10),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomResizedCrop(img_size, scale=(0.9, 1.0))
+        ]
+
+    training_transforms = transforms.Compose(aug_transforms + common_transforms)
     
     dataset = torchvision.datasets.ImageFolder(root=path, transform=training_transforms)
     return dataset.class_to_idx, dataset
