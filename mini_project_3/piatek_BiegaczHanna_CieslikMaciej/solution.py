@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from PIL import Image
 
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TRAINING_DATA_PATH = os.path.abspath(os.path.join(SCRIPT_DIR, '..', 'train'))
 TESTING_DATA_PATH  = os.path.abspath(os.path.join(SCRIPT_DIR, '..', 'test'))
@@ -24,14 +25,15 @@ class NetConfig:
     dropout_rates: List[float]        = field(default_factory=lambda: [0.3])
     activation_types: List[type]      = field(default_factory=lambda: [nn.ReLU])
     use_batch_normalization: bool     = True
+    batch_size: int                   = 256
     epochs: int                       = 10
     learning_rate: float              = 0.001
-    batch_size: int                   = 128
 
     def expand_parameter_for_layers(self, parameter_list: list, layer_count: int) -> list:
         if len(parameter_list) == 1:
             return parameter_list * layer_count
         return parameter_list
+
 
 class UnlabeledImageDataset(Dataset):
     def __init__(self, root_directory, transform=None):
@@ -49,11 +51,13 @@ class UnlabeledImageDataset(Dataset):
         filename = self.image_filenames[index]
         image_path = os.path.join(self.root_directory, filename)
         image = Image.open(image_path).convert('RGB')
-        
+
         if self.transform:
             image = self.transform(image)
-            
+
         return image, filename
+
+
 
 class NeuralNetwork:
     def __init__(self, config: NetConfig, num_classes: int = 50):
@@ -91,7 +95,7 @@ class NeuralNetwork:
             if dropout_rate > 0:
                 network_layers.append(nn.Dropout(dropout_rate))
             current_dimension = hidden_units
-        
+
         network_layers.append(nn.Linear(current_dimension, num_classes))
         return nn.Sequential(*network_layers)
 
@@ -135,21 +139,19 @@ class NeuralNetwork:
     def predict(self, data_loader: DataLoader) -> List[Tuple[str, int]]:
         self.model.eval()
         all_predictions = []
-        
+
         with torch.no_grad():
             for images, meta in data_loader:
                 images = images.to(self.device)
                 outputs = self.model(images)
                 predicted_classes = outputs.argmax(dim=1).cpu().numpy()
-                
-                # meta can be filenames (test set) or labels (train set)
-                # if labels, it's a tensor, if filenames, it's a tuple of strings
+
                 if isinstance(meta, torch.Tensor):
                     meta = meta.cpu().numpy()
-                
+
                 for m, p in zip(meta, predicted_classes):
                     all_predictions.append((m, int(p)))
-                    
+
         return all_predictions
 
 
@@ -194,16 +196,17 @@ def save_predictions_to_csv(predictions: List[Tuple[str, int]], output_path: str
         writer = csv.writer(csv_file)
         writer.writerows(predictions)
 
+
+
 def main():
     final_config = NetConfig(epochs=10, use_batch_normalization=True)
-    if torch.cuda.is_available():
-        print(f"\n--- Using GPU ({torch.cuda.get_device_name(0)}) ---\n")
+    if torch.cuda.is_available(): print(f"\n--- Using GPU ({torch.cuda.get_device_name(0)}) ---\n")
     else: print("\n--- Using CPU ---\n")
 
     print("[Step 1/4] Loading datasets...")
     _, train_dataset = read_trainset(augmentation="none", img_size=IMG_SIZE)
     test_dataset = read_testset()
-    
+
     train_loader = DataLoader(
         train_dataset, 
         batch_size=final_config.batch_size, 
