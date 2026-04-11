@@ -208,15 +208,17 @@ def main():
         train_dataset, 
         batch_size=final_config.batch_size, 
         shuffle=True, 
-        num_workers=4,
+        num_workers=8,
         pin_memory=True if torch.cuda.is_available() else False
     )
     test_loader = DataLoader(
         test_dataset, 
         batch_size=final_config.batch_size, 
         shuffle=False,
-        num_workers=4,
-        pin_memory=True if torch.cuda.is_available() else False
+        num_workers=8,
+        pin_memory=torch.cuda.is_available(),
+        prefetch_factor=2,          
+        persistent_workers=True     
     )
 
     print("\n[Step 2/4] Initializing and training the model...")
