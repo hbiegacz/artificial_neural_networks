@@ -15,6 +15,8 @@ TRAINING_DATA_PATH = os.path.abspath(os.path.join(SCRIPT_DIR, '..', 'train'))
 TESTING_DATA_PATH  = os.path.abspath(os.path.join(SCRIPT_DIR, '..', 'test'))
 OUTPUT_PATH = os.path.join(SCRIPT_DIR, 'pred.csv')
 
+IMG_SIZE = 48
+
 @dataclass
 class NetConfig:
     convolutional_layers: List[int]   = field(default_factory=lambda: [32, 64, 128, 256])
@@ -62,7 +64,7 @@ class NeuralNetwork:
     def initialize_network(self, num_classes: int) -> nn.Sequential:
         network_layers = []
         current_channels = 3
-        
+
         for output_channels in self.config.convolutional_layers:
             network_layers.append(nn.Conv2d(current_channels, output_channels, kernel_size=3, padding=1))
             if self.config.use_batch_normalization:
@@ -70,16 +72,16 @@ class NeuralNetwork:
             network_layers.append(nn.ReLU())
             network_layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
             current_channels = output_channels
-        
+
         network_layers.append(nn.Flatten())
-        
-        image_dimension = 64 // (2 ** len(self.config.convolutional_layers))
+
+        image_dimension = IMG_SIZE // (2 ** len(self.config.convolutional_layers))
         flattened_size = current_channels * (image_dimension ** 2)
-        
+
         num_fc = len(self.config.fully_connected_layers)
         dropouts = self.config.expand_parameter_for_layers(self.config.dropout_rates, num_fc)
         activations = self.config.expand_parameter_for_layers(self.config.activation_types, num_fc)
-        
+
         current_dimension = flattened_size
         for hidden_units, dropout_rate, activation_type in zip(self.config.fully_connected_layers, dropouts, activations):
             network_layers.append(nn.Linear(current_dimension, hidden_units))
@@ -150,10 +152,11 @@ class NeuralNetwork:
                     
         return all_predictions
 
+
+
 def read_trainset(path: str = TRAINING_DATA_PATH, augmentation: str = 'none', img_size: int = IMG_SIZE):
     common_transforms = [
-        transforms.Resize((64, 64)),
-        transforms.RandomHorizontalFlip(),
+        transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ]
@@ -171,17 +174,19 @@ def read_trainset(path: str = TRAINING_DATA_PATH, augmentation: str = 'none', im
         ]
 
     training_transforms = transforms.Compose(aug_transforms + common_transforms)
-    
+
     dataset = torchvision.datasets.ImageFolder(root=path, transform=training_transforms)
     return dataset.class_to_idx, dataset
 
-def read_testset(path: str = TESTING_DATA_PATH):
+
+
+def read_testset(path: str = TESTING_DATA_PATH, img_size: int = IMG_SIZE):
     testing_transforms = transforms.Compose([
-        transforms.Resize((64, 64)),
+        transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    
+
     return UnlabeledImageDataset(root_directory=path, transform=testing_transforms)
 
 def save_predictions_to_csv(predictions: List[Tuple[str, int]], output_path: str = OUTPUT_PATH):
@@ -196,7 +201,7 @@ def main():
     else: print("\n--- Using CPU ---\n")
 
     print("[Step 1/4] Loading datasets...")
-    class_mapping, train_dataset = read_trainset()
+    _, train_dataset = read_trainset(augmentation="none", img_size=IMG_SIZE)
     test_dataset = read_testset()
     
     train_loader = DataLoader(
