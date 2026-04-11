@@ -95,27 +95,26 @@ class NeuralNetwork:
         network_layers.append(nn.Linear(current_dimension, num_classes))
         return nn.Sequential(*network_layers)
 
-    def fit(self, training_loader: DataLoader):
+
+
+    def fit(self, training_loader: DataLoader, print_epochs: bool =False):
         optimizer = optim.Adam(self.model.parameters(), lr=self.config.learning_rate)
         loss_function = nn.CrossEntropyLoss()
-        
-        # Mixed Precision Scaler
         scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
-        
+
         for epoch in range(self.config.epochs):
             self.model.train()
             running_loss, correct_predictions, total_samples = 0.0, 0, 0
-            
+
             for images, labels in training_loader:
                 images, labels = images.to(self.device, non_blocking=True), labels.to(self.device, non_blocking=True)
-                
+
                 optimizer.zero_grad()
-                
-                # Use mixed precision context
+
                 with torch.amp.autocast('cuda', enabled=(scaler is not None)):
                     outputs = self.model(images)
                     loss = loss_function(outputs, labels)
-                
+
                 if scaler:
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
@@ -123,14 +122,15 @@ class NeuralNetwork:
                 else:
                     loss.backward()
                     optimizer.step()
-                
+
                 running_loss += loss.item() * images.size(0)
                 correct_predictions += outputs.argmax(dim=1).eq(labels).sum().item()
                 total_samples += labels.size(0)
-                
+
             average_loss = running_loss / total_samples
             accuracy = 100.0 * correct_predictions / total_samples
-            print(f"\tEpoch {epoch+1}/{self.config.epochs} - Loss: {average_loss:.4f}, Accuracy: {accuracy:.2f}%")
+            if print_epochs: print(f"\tEpoch {epoch+1}/{self.config.epochs} - Loss: {average_loss:.4f}, Accuracy: {accuracy:.2f}%")
+
 
     def predict(self, data_loader: DataLoader) -> List[Tuple[str, int]]:
         self.model.eval()
@@ -218,11 +218,11 @@ def main():
         num_workers=4,
         pin_memory=True if torch.cuda.is_available() else False
     )
-    
+
     print("\n[Step 2/4] Initializing and training the model...")
     network = NeuralNetwork(final_config, num_classes=len(train_dataset.classes))
-    network.fit(train_loader)
-    
+    network.fit(train_loader, print_epochs=True)
+
     print("\n[Step 3/4] Generating predictions for test set...")
     predictions = network.predict(test_loader)
 
