@@ -7,7 +7,7 @@ import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Dataset
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 from PIL import Image
 
 
@@ -16,18 +16,18 @@ TRAINING_DATA_PATH = os.path.abspath(os.path.join(SCRIPT_DIR, '..', 'train'))
 TESTING_DATA_PATH  = os.path.abspath(os.path.join(SCRIPT_DIR, '..', 'test'))
 OUTPUT_PATH = os.path.join(SCRIPT_DIR, 'pred.csv')
 
-IMG_SIZE = 48
+IMG_SIZE = 64
 
 @dataclass
 class NetConfig:
     convolutional_layers: List[int]   = field(default_factory=lambda: [32, 64, 128, 256])
     fully_connected_layers: List[int] = field(default_factory=lambda: [512, 128])
-    dropout_rates: List[float]        = field(default_factory=lambda: [0.3])
+    dropout_rates: List[float]        = field(default_factory=lambda: [0.2])
     activation_types: List[type]      = field(default_factory=lambda: [nn.ReLU])
     use_batch_normalization: bool     = True
-    batch_size: int                   = 256
-    epochs: int                       = 10
-    learning_rate: float              = 0.001
+    batch_size: int                   = 64
+    epochs: int                       = 25
+    learning_rate: float              = 3e-4
 
     def expand_parameter_for_layers(self, parameter_list: list, layer_count: int) -> list:
         if len(parameter_list) == 1:
