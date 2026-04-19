@@ -22,12 +22,16 @@ IMG_SIZE = 64
 class NetConfig:
     convolutional_layers: List[int]   = field(default_factory=lambda: [32, 64, 128, 256])
     fully_connected_layers: List[int] = field(default_factory=lambda: [512, 128])
-    dropout_rates: List[float]        = field(default_factory=lambda: [0.2])
+    dropout_rates: List[float]        = field(default_factory=lambda: [0.5])
     activation_types: List[type]      = field(default_factory=lambda: [nn.ReLU])
     use_batch_normalization: bool     = True
     batch_size: int                   = 64
     epochs: int                       = 25
-    learning_rate: float              = 3e-4
+    learning_rate: float              = 1e-3
+    optimizer_type: str               = "Adam" 
+    weight_decay: float               = 1e-5
+    momentum: float                   = 0.9
+    nesterov: bool                    = False
 
     def expand_parameter_for_layers(self, parameter_list: list, layer_count: int) -> list:
         if len(parameter_list) == 1:
@@ -102,7 +106,18 @@ class NeuralNetwork:
 
 
     def fit(self, training_loader: DataLoader, print_epochs: bool =False):
-        optimizer = optim.Adam(self.model.parameters(), lr=self.config.learning_rate)
+        lr = self.config.learning_rate
+        wd = self.config.weight_decay
+        opt_type = self.config.optimizer_type
+
+        if opt_type == "Adam":
+            optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=wd)
+        elif opt_type == "AdamW":
+            optimizer = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=wd)
+        elif opt_type == "SGD":
+            momentum = getattr(self.config, 'momentum', 0.9)
+            optimizer = optim.SGD(self.model.parameters(), lr=lr, weight_decay=wd, momentum=momentum)
+            
         loss_function = nn.CrossEntropyLoss()
         scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
 
