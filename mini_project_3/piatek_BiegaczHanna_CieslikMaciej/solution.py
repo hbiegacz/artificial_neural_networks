@@ -214,7 +214,7 @@ def save_predictions_to_csv(predictions: List[Tuple[str, int]], output_path: str
 
 
 def main():
-    final_config = NetConfig(epochs=10, use_batch_normalization=True)
+    final_config = NetConfig()
     if torch.cuda.is_available(): print(f"\n--- Using GPU ({torch.cuda.get_device_name(0)}) ---\n")
     else: print("\n--- Using CPU ---\n")
 
