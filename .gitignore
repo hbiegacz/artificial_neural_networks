@@ -155,3 +155,4 @@ cython_debug/
 # OS files
 .DS_Store
 Thumbs.db
+temp_reference_flat/
