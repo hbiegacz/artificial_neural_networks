@@ -1,684 +1,306 @@
 import os
-import time
-import itertools
-import json
-import random
-
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
 
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import List, Optional, Callable, Dict, Tuple
-from torch.utils.data import DataLoader, random_split
-from scipy import linalg
+from torch.utils.data import DataLoader
+from typing import List, Dict, Tuple
 
 
-# ---------------------------------------------------------------------------
-# Ścieżki
-# ---------------------------------------------------------------------------
-SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TRAIN_DATA_PATH = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "train", "trafic_32"))
-OUTPUT_PATH     = os.path.join(SCRIPT_DIR, "piatek_Biegacz_Cieslik.pt")
+OUTPUT_PATH = os.path.join(SCRIPT_DIR, "piatek_Biegacz_Cieslik.pt")
 
 
-# ---------------------------------------------------------------------------
-# Seed
-# ---------------------------------------------------------------------------
-SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark     = False
-
-
-# ---------------------------------------------------------------------------
-# Konfiguracja
-# ---------------------------------------------------------------------------
 @dataclass
-class NetConfig:
-    # architektura
-    in_channels:    int   = 3
-    out_channels:   int   = 3
-    channel_sizes:  list  = field(default_factory=lambda: [32, 64, 128])
-    kernel_size:    int   = 5
-    activation:     str   = "silu"
-    use_batchnorm:  bool  = False
-    t_emb_dim:      int   = 1
+class VAEConfig:
+    image_size: int = 32
+    input_channels: int = 3
+    latent_dimension: int = 1024
+    num_classes: int = 43          
+    class_embedding_dim: int = 64  
+    encoder_channels: List[int] = field(default_factory=lambda: [64, 64, 128])
+    learning_rate: float = 1e-3
+    batch_size: int = 32
+    epochs: int = 60
+    kl_weight: float = 0.001
 
-    # trening
-    epochs:         int   = 60
-    lr:             float = 3e-4
-    optimizer_name: str   = "adamw"    # "adam" | "adamw" | "sgd"
-    loss_name:      str   = "mse"      # "mse"  | "mae"   | "huber"
-    scheduler_name: str   = "cosine"   # "none" | "cosine"| "step"
-    grad_clip:      float = 1.0        # 0.0 = wyłączony
+    optimizer_type: str = "Adam"
+    weight_decay: float = 0.0
 
-    # dane
-    batch_size:     int   = 64
-    train_split:    float = 0.8
-    num_workers:    int   = 2
+    train_data_path: str = TRAIN_DATA_PATH
+    output_path: str = OUTPUT_PATH
+
     mean: Tuple[float, float, float] = (0.5, 0.5, 0.5)
-    std:  Tuple[float, float, float] = (0.5, 0.5, 0.5)
-    train_data_path: str  = TRAIN_DATA_PATH
+    std: Tuple[float, float, float] = (0.5, 0.5, 0.5)
 
-    # zaszumianie
-    corrupt_fn: Optional[Callable] = None   # None = wbudowana default_corrupt
+    num_workers: int = 4
 
-    # FID
-    eval_fid:            bool = True
-    eval_every:          int  = 5
-    fid_n_generated:     int  = 512
-    fid_steps:           int  = 40
-    fid_evaluator_epochs: int = 20
-    save_best_by:        str  = "fid"   # "fid" | "loss"
+    def feature_map_size(self) -> int:
+        """Keeps linear layers valid even when image size or encoder depth changes."""
+        return self.image_size // (2 ** len(self.encoder_channels))
 
-    # wyjście
-    save_path:  str  = OUTPUT_PATH
-    log_every:  int  = 1
-    print_images: bool = False
+    def flattened_size(self) -> int:
+        """Derives the latent projection size from the config, so architecture changes stay consistent."""
+        return self.encoder_channels[-1] * self.feature_map_size() * self.feature_map_size()
 
 
-# ---------------------------------------------------------------------------
-# Funkcje aktywacji
-# ---------------------------------------------------------------------------
-ACTIVATIONS: Dict[str, type] = {
-    "silu":  nn.SiLU,
-    "relu":  nn.ReLU,
-    "gelu":  nn.GELU,
-    "mish":  nn.Mish,
-    "tanh":  nn.Tanh,
-    "leaky": nn.LeakyReLU,
-    "elu":   nn.ELU,
-}
-
-
-# ---------------------------------------------------------------------------
-# Blok konwolucyjny
-# ---------------------------------------------------------------------------
-class ConvBlock(nn.Module):
-    def __init__(
-        self,
-        in_ch:        int,
-        out_ch:       int,
-        kernel_size:  int  = 5,
-        activation:   str  = "silu",
-        use_batchnorm: bool = False,
-    ):
-        super().__init__()
-        padding = kernel_size // 2
-        layers: List[nn.Module] = [
-            nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size, padding=padding),
-        ]
-        if use_batchnorm:
-            layers.append(nn.BatchNorm2d(out_ch))
-        act_cls = ACTIVATIONS.get(activation.lower())
-        if act_cls is None:
-            raise ValueError(f"Nieznana aktywacja '{activation}'. Dostępne: {list(ACTIVATIONS)}")
-        layers.append(act_cls())
-        self.block = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
-
-
-# ---------------------------------------------------------------------------
-# Model: ParametricUNet (Flow Matching / denoising)
-# ---------------------------------------------------------------------------
-class ParametricUNet(nn.Module):
-    """
-    Parametryczny U-Net z warunkowym embeddingiem czasu t.
-    Encoder: conv + maxpool (skip connections).
-    Decoder: upsample + concat skip + conv.
-    """
-
-    def __init__(self, config: NetConfig):
+class VariationalAutoencoder(nn.Module):
+    def __init__(self, config: VAEConfig):
+        """Sets up the VAE model parts: class embeddings, encoder, and decoder."""
         super().__init__()
         self.config = config
 
-        n_levels     = len(config.channel_sizes)
-        self.channel_sizes = config.channel_sizes
-        self.t_emb_dim     = config.t_emb_dim
+        self.class_embedding = nn.Embedding(config.num_classes, config.class_embedding_dim)
 
-        # --- Encoder (ścieżka w dół) ---
-        down_blocks: List[nn.Module] = []
-        prev_ch = config.in_channels
-        for ch in config.channel_sizes:
-            down_blocks.append(
-                ConvBlock(prev_ch, ch, config.kernel_size, config.activation, config.use_batchnorm)
+        encoder_layers = []
+        current_channels = config.input_channels
+        for output_channels in config.encoder_channels:
+            encoder_layers.extend([
+                nn.Conv2d(current_channels, output_channels, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm2d(output_channels),
+                nn.LeakyReLU(0.2, inplace=True),
+            ])
+            current_channels = output_channels
+        self.encoder = nn.Sequential(*encoder_layers)
+
+        encoder_out_size = config.flattened_size() + config.class_embedding_dim
+        self.to_mean = nn.Linear(encoder_out_size, config.latent_dimension)
+        self.to_log_variance = nn.Linear(encoder_out_size, config.latent_dimension)
+
+        decoder_in_size = config.latent_dimension + config.class_embedding_dim
+        self.from_latent = nn.Linear(decoder_in_size, config.flattened_size())
+
+        decoder_channels = list(reversed(config.encoder_channels[:-1])) + [config.input_channels]
+        decoder_layers = []
+        current_channels = config.encoder_channels[-1]
+
+        for output_channels in decoder_channels[:-1]:
+            decoder_layers.extend([
+                nn.ConvTranspose2d(current_channels, output_channels, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm2d(output_channels),
+                nn.ReLU(inplace=True),
+            ])
+            current_channels = output_channels
+
+        decoder_layers.extend([
+            nn.ConvTranspose2d(current_channels, decoder_channels[-1], kernel_size=4, stride=2, padding=1),
+            nn.Tanh(),
+        ])
+        self.decoder = nn.Sequential(*decoder_layers)
+
+    def encode(self, images: torch.Tensor, class_labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Changes input images and labels into mean and variance for the latent space."""
+        features = self.encoder(images)
+        features = features.view(images.size(0), -1)
+        class_emb = self.class_embedding(class_labels)
+        features = torch.cat([features, class_emb], dim=1)
+        return self.to_mean(features), self.to_log_variance(features)
+
+    def sample_latent(self, mean: torch.Tensor, log_variance: torch.Tensor) -> torch.Tensor:
+        """Samples a random vector using the mean and variance."""
+        std = torch.exp(0.5 * log_variance)
+        noise = torch.randn_like(std)
+        return mean + noise * std
+
+    def decode(self, latent_vectors: torch.Tensor, class_labels: torch.Tensor) -> torch.Tensor:
+        """Turns the latent vectors and class labels back into images."""
+        class_emb = self.class_embedding(class_labels)
+        z = torch.cat([latent_vectors, class_emb], dim=1)
+        features = self.from_latent(z)
+        features = features.view(
+            latent_vectors.size(0),
+            self.config.encoder_channels[-1],
+            self.config.feature_map_size(),
+            self.config.feature_map_size(),
+        )
+        return self.decoder(features)
+
+    def forward(self, images: torch.Tensor, class_labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Does a full pass: encodes images, samples a vector, and decodes it back."""
+        mean, log_variance = self.encode(images, class_labels)
+        latent_vectors = self.sample_latent(mean, log_variance)
+        reconstructed_images = self.decode(latent_vectors, class_labels)
+        return reconstructed_images, mean, log_variance
+
+
+class VAEExperiment:
+    def __init__(self, config: VAEConfig):
+        """Sets up the training environment, model, and optimizer."""
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = VariationalAutoencoder(config).to(self.device)
+        self.optimizer = self.create_optimizer()
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=config.epochs,
+            eta_min=1e-5
+        )
+
+    def create_optimizer(self):
+        """Keeps optimizer choice configurable without changing training code."""
+        if self.config.optimizer_type == "AdamW":
+            return optim.AdamW(
+                self.model.parameters(),
+                lr=self.config.learning_rate,
+                weight_decay=self.config.weight_decay,
             )
-            prev_ch = ch
-        self.down_layers = nn.ModuleList(down_blocks)
+        return optim.Adam(
+            self.model.parameters(),
+            lr=self.config.learning_rate,
+            weight_decay=self.config.weight_decay,
+        )
 
-        # --- Decoder (ścieżka w górę) ---
-        reversed_ch  = list(reversed(config.channel_sizes))
-        up_blocks: List[nn.Module] = []
+    def compute_loss(
+        self,
+        original_images: torch.Tensor,
+        reconstructed_images: torch.Tensor,
+        mean: torch.Tensor,
+        log_variance: torch.Tensor,
+        current_epoch: int,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Calculates the total loss using reconstruction error and KL penalty."""
+        l1_loss = F.l1_loss(reconstructed_images, original_images)
+        mse_loss = F.mse_loss(reconstructed_images, original_images)
+        reconstruction_loss = 0.8 * l1_loss + 0.2 * mse_loss
 
-        for i in range(n_levels):
-            if i == 0:
-                in_ch = reversed_ch[0] + config.t_emb_dim  # bottleneck + t_emb
-            else:
-                in_ch = reversed_ch[i - 1] + reversed_ch[i]  # poprzedni + skip
+        kl_divergence = -0.5 * torch.mean(
+            1 + log_variance - mean.pow(2) - log_variance.exp()
+        )
 
-            out_ch = reversed_ch[i] if i < n_levels - 1 else config.out_channels
+        warmup_epochs = self.config.epochs // 2
+        annealed_kl_weight = min(1.0, current_epoch / max(1, warmup_epochs)) * self.config.kl_weight
 
-            if i == n_levels - 1:
-                # ostatnia warstwa — zwykła konwolucja (bez aktivacji)
-                up_blocks.append(
-                    nn.Conv2d(in_ch, out_ch,
-                              kernel_size=config.kernel_size,
-                              padding=config.kernel_size // 2)
+        total_loss = reconstruction_loss + annealed_kl_weight * kl_divergence
+
+        return total_loss, {
+            "total_loss": float(total_loss.detach().cpu()),
+            "reconstruction_loss": float(reconstruction_loss.detach().cpu()),
+            "kl_divergence": float(kl_divergence.detach().cpu()),
+        }
+
+    def train_epoch(self, data_loader: DataLoader, epoch: int) -> Dict[str, float]:
+        """Runs one training step over all data and returns the average loss."""
+        self.model.train()
+        metrics_sum = {"total_loss": 0.0, "reconstruction_loss": 0.0, "kl_divergence": 0.0}
+
+        for images, class_labels in data_loader:          
+            images = images.to(self.device)
+            class_labels = class_labels.to(self.device)   
+            self.optimizer.zero_grad()
+
+            reconstructed_images, mean, log_variance = self.model(images, class_labels)  
+            loss, metrics = self.compute_loss(images, reconstructed_images, mean, log_variance, epoch)
+
+            loss.backward()
+            self.optimizer.step()
+
+            for key in metrics_sum:
+                metrics_sum[key] += metrics[key]
+
+        batch_count = len(data_loader)
+        return {key: value / batch_count for key, value in metrics_sum.items()}
+
+    def fit(self, data_loader: DataLoader, print_progress: bool = True):
+        """Returns the full learning history because trends matter during model selection."""
+        history = []
+
+        for epoch in range(self.config.epochs):
+            epoch_metrics = self.train_epoch(data_loader, epoch)  
+            self.scheduler.step()
+            history.append(epoch_metrics)
+
+            if print_progress:
+                print(
+                    f"Epoch {epoch + 1}/{self.config.epochs} - "
+                    f"loss: {epoch_metrics['total_loss']:.4f}, "
+                    f"recon: {epoch_metrics['reconstruction_loss']:.4f}, "
+                    f"kl: {epoch_metrics['kl_divergence']:.4f}"
                 )
-            else:
-                up_blocks.append(
-                    ConvBlock(in_ch, out_ch, config.kernel_size, config.activation, config.use_batchnorm)
-                )
 
-        self.up_layers = nn.ModuleList(up_blocks)
-        self.downscale = nn.MaxPool2d(2)
-        self.upscale   = nn.Upsample(scale_factor=2, mode="nearest")
+        return history
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """
-        x : (B, C, H, W)  — zaszumiony obraz
-        t : (B, 1)         — czas (embedding czasu)
-        """
-        n_levels = len(self.channel_sizes)
-        skip_connections: List[torch.Tensor] = []
-
-        # Encoder
-        for i, layer in enumerate(self.down_layers):
-            x = layer(x)
-            if i < n_levels - 1:
-                skip_connections.append(x)
-                x = self.downscale(x)
-
-        # Wstrzykniecie t jako mapa cech (broadcast po H, W)
-        t_map = t.view(t.size(0), self.t_emb_dim, 1, 1).expand(-1, -1, x.size(2), x.size(3))
-        x = torch.cat([x, t_map], dim=1)
-
-        # Decoder
-        for i, layer in enumerate(self.up_layers):
-            if i > 0:
-                x = self.upscale(x)
-                skip = skip_connections.pop()
-                x = torch.cat([x, skip], dim=1)
-            x = layer(x)
-
-        return x
+    def generate_samples(self, number_of_samples: int) -> torch.Tensor:
+        """Generates new images from random noise and random class labels."""
+        self.model.eval()
+        with torch.no_grad():
+            latent_vectors = torch.randn(number_of_samples, self.config.latent_dimension, device=self.device)
+            class_labels = torch.arange(number_of_samples, device=self.device) % self.config.num_classes
+            generated_images = self.model.decode(latent_vectors, class_labels)
+        return generated_images
 
 
-# ---------------------------------------------------------------------------
-# Ewaluator (prosty klasyfikator do FID)
-# ---------------------------------------------------------------------------
-class Evaluator(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int = 256):
-        super().__init__()
-        self.fc_1   = nn.Linear(input_dim, hidden_dim)
-        self.fc_2   = nn.Linear(hidden_dim, 50)
-        self.fc_out = nn.Linear(50, 43)
-        self.act    = nn.LeakyReLU(0.2)
-
-    def get_features(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.flatten(x, 1)
-        x = self.act(self.fc_1(x))
-        x = self.act(self.fc_2(x))
-        return x
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc_out(self.get_features(x))
-
-
-# ---------------------------------------------------------------------------
-# Helpers: fabryki i funkcje pomocnicze
-# ---------------------------------------------------------------------------
-def build_optimizer(name: str, params, lr: float) -> torch.optim.Optimizer:
-    name = name.lower()
-    if name == "adam":
-        return torch.optim.Adam(params, lr=lr)
-    elif name == "adamw":
-        return torch.optim.AdamW(params, lr=lr, weight_decay=1e-4)
-    elif name == "sgd":
-        return torch.optim.SGD(params, lr=lr, momentum=0.9)
-    raise ValueError(f"Nieznany optimizer: '{name}'. Dostępne: adam, adamw, sgd")
-
-
-def build_loss(name: str) -> nn.Module:
-    name = name.lower()
-    if name == "mse":
-        return nn.MSELoss()
-    elif name == "mae":
-        return nn.L1Loss()
-    elif name == "huber":
-        return nn.HuberLoss()
-    raise ValueError(f"Nieznana funkcja straty: '{name}'. Dostępne: mse, mae, huber")
-
-
-def build_scheduler(name: str, optimizer, epochs: int):
-    name = name.lower()
-    if name == "none":
-        return None
-    elif name == "cosine":
-        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    elif name == "step":
-        return torch.optim.lr_scheduler.StepLR(optimizer, step_size=epochs // 3, gamma=0.5)
-    raise ValueError(f"Nieznany scheduler: '{name}'. Dostępne: none, cosine, step")
-
-
-def default_corrupt(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    """Interpolacja między oryginalem a szumem równomiernym wg t."""
-    noise  = torch.rand_like(x)
-    amount = t.view(-1, 1, 1, 1)
-    return x * (1 - amount) + noise * amount
-
-
-def create_transforms(config: NetConfig) -> transforms.Compose:
+def create_transforms(config: VAEConfig):
+    """Sets up image changes like resize and color tweaks."""
     return transforms.Compose([
-        transforms.Resize((32, 32)),
+        transforms.Resize((config.image_size, config.image_size)),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),  
         transforms.ToTensor(),
         transforms.Normalize(mean=config.mean, std=config.std),
     ])
 
 
-def read_dataset(config: NetConfig):
-    """Wczytuje dataset z ImageFolder + oblicza mean/std."""
-    temp_transform = transforms.Compose([
-        transforms.Resize((32, 32)),
-        transforms.ToTensor(),
-    ])
-    full_dataset = torchvision.datasets.ImageFolder(
+def read_train_dataset(config: VAEConfig):
+    """Loads the training dataset from the folders."""
+    dataset = torchvision.datasets.ImageFolder(
         root=config.train_data_path,
-        transform=temp_transform,
+        transform=create_transforms(config),
     )
-    return full_dataset
+    return dataset.class_to_idx, dataset
 
 
-# ---------------------------------------------------------------------------
-# Helpers: FID
-# ---------------------------------------------------------------------------
-def _frechet_distance(dist1: np.ndarray, dist2: np.ndarray, eps: float = 1e-6) -> float:
-    mu1, sigma1 = np.mean(dist1, axis=0), np.cov(dist1, rowvar=False)
-    mu2, sigma2 = np.mean(dist2, axis=0), np.cov(dist2, rowvar=False)
-    mu1, mu2    = np.atleast_1d(mu1), np.atleast_1d(mu2)
-    sigma1      = np.atleast_2d(sigma1)
-    sigma2      = np.atleast_2d(sigma2)
-    diff = mu1 - mu2
-    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
-    if not np.isfinite(covmean).all():
-        offset  = np.eye(sigma1.shape[0]) * eps
-        covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
-    return float(diff.dot(diff) + np.trace(sigma1 + sigma2 - 2 * covmean))
+def create_data_loader(dataset, config: VAEConfig, shuffle: bool = True):
+    """Creates a data loader to feed images inside the training loop."""
+    return DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=shuffle,
+        num_workers=config.num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
 
 
-@torch.no_grad()
-def _extract_features(evaluator: Evaluator, loader, device: str) -> np.ndarray:
-    evaluator.eval()
-    features = []
-    for x, _ in loader:
-        features.append(evaluator.get_features(x.to(device)).cpu().numpy())
-    return np.concatenate(features, axis=0)
+def denormalize_images(images: torch.Tensor, config: VAEConfig) -> torch.Tensor:
+    """Changes image pixels back to normal colors (0 to 1)."""
+    mean = torch.tensor(config.mean, device=images.device).view(1, 3, 1, 1)
+    std = torch.tensor(config.std, device=images.device).view(1, 3, 1, 1)
+    return torch.clamp(images * std + mean, 0.0, 1.0)
 
 
-def _train_evaluator(
-    evaluator:   Evaluator,
-    train_loader: DataLoader,
-    epochs:      int,
-    device:      str,
-) -> Evaluator:
-    evaluator.to(device).train()
-    optimizer = torch.optim.Adam(evaluator.parameters(), lr=1e-3)
-    loss_fn   = nn.CrossEntropyLoss()
-    for epoch in range(epochs):
-        total = 0.0
-        for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
-            loss  = loss_fn(evaluator(x), y)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total += loss.item()
-        print(f"  Evaluator [{epoch+1}/{epochs}] loss={total/len(train_loader):.4f}")
-    return evaluator.eval()
+def save_generated_samples(images: torch.Tensor, output_path: str):
+    """Saves the generated images to a file."""
+    torch.save(images.cpu().detach(), output_path)
+
+def main():
+    """Runs the whole process: loads data, trains the model, and saves new images."""
+    config = VAEConfig()
+
+    if torch.cuda.is_available():
+        print(f"--- Using GPU: {torch.cuda.get_device_name(0)} ---")
+    else:
+        print("--- Using CPU ---")
+
+    print("Step 1/4 Loading training dataset...")
+    _, train_dataset = read_train_dataset(config)
+    train_loader = create_data_loader(train_dataset, config, shuffle=True)
+
+    print("Step 2/4 Initializing and training VAE...")
+    experiment = VAEExperiment(config)
+    experiment.fit(train_loader, print_progress=True)
+
+    print("Step 3/4 Generating 1000 samples...")
+    generated_images = experiment.generate_samples(1000)
+    generated_images = denormalize_images(generated_images, config)
+
+    print("Step 4/4 Saving generated samples...")
+    save_generated_samples(generated_images, config.output_path)
+
+    print(f"--- Finished. Samples saved to: {config.output_path} ---")
 
 
-@torch.no_grad()
-def sample_images(
-    net:       nn.Module,
-    n_images:  int,
-    img_shape: Tuple[int, int, int],
-    steps:     int = 40,
-    device:    str = "cpu",
-) -> torch.Tensor:
-    """Flow-matching sampling: interpolacja od szumu do obrazu."""
-    net.eval()
-    C, H, W  = img_shape
-    x        = torch.rand(n_images, C, H, W, device=device)
-    schedule = torch.linspace(1.0, 0.0, steps, device=device)
-    for i, t_val in enumerate(schedule):
-        t    = torch.full((n_images,), t_val, device=device)
-        pred = net(x, t.unsqueeze(1)).clamp(0, 1)
-        if i < steps - 1:
-            t_next = schedule[i + 1]
-            x      = pred * (1 - t_next) + torch.rand_like(x) * t_next
-        else:
-            x = pred
-    return x
-
-
-def _evaluate_fid(
-    net:         nn.Module,
-    evaluator:   Evaluator,
-    test_loader: DataLoader,
-    config:      NetConfig,
-    device:      str,
-) -> float:
-    img_shape = (config.in_channels, 32, 32)
-    real_feat = _extract_features(evaluator, test_loader, device)
-    generated = sample_images(net, config.fid_n_generated, img_shape,
-                               steps=config.fid_steps, device=device)
-    gen_ds     = torch.utils.data.TensorDataset(generated, torch.zeros(config.fid_n_generated))
-    gen_loader = DataLoader(gen_ds, batch_size=64)
-    gen_feat   = _extract_features(evaluator, gen_loader, device)
-    return _frechet_distance(real_feat, gen_feat)
-
-
-# ---------------------------------------------------------------------------
-# Klasa eksperymentu
-# ---------------------------------------------------------------------------
-class DiffusionExperiment:
-    def __init__(self, config: NetConfig):
-        self.config    = config
-        self.device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model     = ParametricUNet(config).to(self.device)
-        self.optimizer = build_optimizer(config.optimizer_name, self.model.parameters(), config.lr)
-        self.scheduler = build_scheduler(config.scheduler_name, self.optimizer, config.epochs)
-        self.loss_fn   = build_loss(config.loss_name)
-        self.corrupt_fn = config.corrupt_fn if config.corrupt_fn is not None else default_corrupt
-
-        total_params = sum(p.numel() for p in self.model.parameters())
-        print(f"Urządzenie: {self.device} | Parametry modelu: {total_params:,}")
-
-    # ------------------------------------------------------------------
-    def _train_epoch(self, loader: DataLoader) -> float:
-        self.model.train()
-        total_loss = 0.0
-        for x, _ in loader:
-            x = x.to(self.device)
-            t = torch.rand(x.size(0), device=self.device)
-
-            noisy_x = self.corrupt_fn(x, t)
-            pred    = self.model(noisy_x, t.unsqueeze(1))
-            loss    = self.loss_fn(pred, x)
-
-            self.optimizer.zero_grad()
-            loss.backward()
-            if self.config.grad_clip > 0:
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
-            self.optimizer.step()
-            total_loss += loss.item()
-        return total_loss / len(loader)
-
-    # ------------------------------------------------------------------
-    @torch.no_grad()
-    def _eval_epoch(self, loader: DataLoader) -> float:
-        self.model.eval()
-        total_loss = 0.0
-        for x, _ in loader:
-            x = x.to(self.device)
-            t = torch.rand(x.size(0), device=self.device)
-            noisy_x = self.corrupt_fn(x, t)
-            pred    = self.model(noisy_x, t.unsqueeze(1))
-            total_loss += self.loss_fn(pred, x).item()
-        return total_loss / len(loader)
-
-    # ------------------------------------------------------------------
-    def fit(self, full_dataset) -> List[Dict]:
-        """Trenuje model, opcjonalnie liczy FID. Zwraca historię treningu."""
-        cfg    = self.config
-        device = str(self.device)
-
-        train_size = int(cfg.train_split * len(full_dataset))
-        test_size  = len(full_dataset) - train_size
-        train_ds, test_ds = random_split(full_dataset, [train_size, test_size])
-
-        train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
-                                  shuffle=True,  num_workers=cfg.num_workers)
-        test_loader  = DataLoader(test_ds,  batch_size=cfg.batch_size,
-                                  shuffle=False, num_workers=cfg.num_workers)
-        print(f"Dane: {len(train_ds)} treningowe | {len(test_ds)} testowe")
-
-        # Opcjonalny ewaluator do FID
-        evaluator = None
-        if cfg.eval_fid:
-            if cfg.save_best_by == "fid" and cfg.eval_every > cfg.epochs:
-                raise ValueError("eval_every > epochs — FID nigdy nie zostanie policzony")
-            print(f"
-[FID] Trening Evaluatora ({cfg.fid_evaluator_epochs} epok)...")
-            input_dim = cfg.in_channels * 32 * 32
-            evaluator = Evaluator(input_dim=input_dim).to(self.device)
-            evaluator = _train_evaluator(evaluator, train_loader,
-                                         cfg.fid_evaluator_epochs, device)
-            print("[FID] Evaluator gotowy.
-")
-
-        best_loss = float("inf")
-        best_fid  = float("inf")
-        history: List[Dict] = []
-
-        for epoch in range(cfg.epochs):
-            t0         = time.time()
-            train_loss = self._train_epoch(train_loader)
-            test_loss  = self._eval_epoch(test_loader)
-
-            if self.scheduler is not None:
-                self.scheduler.step()
-
-            # --- FID ---
-            fid = None
-            should_eval_fid = (
-                cfg.eval_fid
-                and evaluator is not None
-                and ((epoch + 1) % cfg.eval_every == 0 or epoch == cfg.epochs - 1)
-            )
-            if should_eval_fid:
-                print(f"[FID] Obliczanie FID (epoka {epoch+1})...")
-                fid = _evaluate_fid(self.model, evaluator, test_loader, cfg, device)
-
-            # --- Zapis najlepszego modelu ---
-            if cfg.save_best_by == "fid":
-                if fid is not None and fid < best_fid:
-                    best_fid = fid
-                    torch.save(self.model.state_dict(), cfg.save_path)
-            else:
-                if test_loss < best_loss:
-                    best_loss = test_loss
-                    torch.save(self.model.state_dict(), cfg.save_path)
-
-            row = {"epoch": epoch + 1, "train_loss": train_loss,
-                   "test_loss": test_loss, "fid": fid}
-            history.append(row)
-
-            if (epoch + 1) % cfg.log_every == 0:
-                elapsed = time.time() - t0
-                lr_now  = self.optimizer.param_groups[0]["lr"]
-                fid_str = f"  fid={fid:.2f}" if fid is not None else ""
-                print(
-                    f"Epoch [{epoch+1:>3}/{cfg.epochs}]  "
-                    f"train={train_loss:.4f}  test={test_loss:.4f}"
-                    f"{fid_str}  lr={lr_now:.2e}  ({elapsed:.1f}s)"
-                )
-
-            if cfg.print_images and (epoch + 1) % 10 == 0:
-                self._preview(epoch + 1, (cfg.in_channels, 32, 32))
-
-        return history
-
-    # ------------------------------------------------------------------
-    def _preview(self, epoch: int, img_shape: Tuple[int, int, int]):
-        import matplotlib.pyplot as plt
-        imgs = sample_images(self.model, 16, img_shape, steps=40, device=str(self.device))
-        grid = torchvision.utils.make_grid(imgs.cpu(), nrow=4, normalize=True)
-        plt.figure(figsize=(5, 5))
-        plt.imshow(grid.permute(1, 2, 0).numpy())
-        plt.title(f"Podgląd — epoka {epoch}")
-        plt.axis("off")
-        plt.show()
-
-    # ------------------------------------------------------------------
-    def generate_samples(self, n_samples: int, steps: int = 40) -> torch.Tensor:
-        """Generuje n_samples obrazów metodą flow-matching."""
-        return sample_images(
-            self.model, n_samples,
-            (self.config.in_channels, 32, 32),
-            steps=steps, device=str(self.device),
-        )
-
-
-# ---------------------------------------------------------------------------
-# Grid search
-# ---------------------------------------------------------------------------
-GRID = {
-    "channel_sizes":  [[32, 64], [32, 64, 128], [64, 128, 256]],
-    "activation":     ["silu", "gelu"],
-    "use_batchnorm":  [False, True],
-    "lr":             [1e-3, 3e-4],
-    "optimizer_name": ["adam", "adamw"],
-}
-
-BASE_CONFIG = dict(
-    in_channels=3, out_channels=3, kernel_size=5,
-    loss_name="mse", scheduler_name="cosine", grad_clip=1.0,
-    epochs=5, batch_size=64, train_split=0.8, num_workers=2,
-    eval_fid=True, eval_every=5, fid_n_generated=64,
-    fid_steps=10, fid_evaluator_epochs=20,
-    save_best_by="fid", log_every=5,
-)
-
-RESULTS_DIR = Path("grid_search_results")
-
-
-def run_grid_search(full_dataset) -> List[Dict]:
-    RESULTS_DIR.mkdir(exist_ok=True)
-    keys   = list(GRID.keys())
-    combos = list(itertools.product(*GRID.values()))
-    print(f"Grid search: {len(combos)} kombinacji | parametry: {keys}\n")
-
-    results = []
-    for idx, combo in enumerate(combos, start=1):
-        params   = dict(zip(keys, combo))
-        run_name = _make_run_name(idx, params)
-        print(f"\n[{idx}/{len(combos)}] {run_name}  |  {params}")
-
-        cfg = NetConfig(**{**BASE_CONFIG, **params,
-                           "save_path": str(RESULTS_DIR / f"{run_name}.pt")})
-        t0 = time.time()
-        try:
-            experiment = DiffusionExperiment(cfg)
-            history    = experiment.fit(full_dataset)
-            elapsed    = time.time() - t0
-
-            fid_vals  = [r["fid"] for r in history if r["fid"] is not None]
-            best_fid  = min(fid_vals) if fid_vals else float("inf")
-            best_loss = min(r["test_loss"] for r in history)
-            results.append({
-                "run_name":       run_name,
-                "params":         params,
-                "best_fid":       best_fid,
-                "best_fid_epoch": next((r["epoch"] for r in history if r["fid"] == best_fid), None),
-                "best_loss":      best_loss,
-                "elapsed_min":    elapsed / 60,
-                "checkpoint":     cfg.save_path,
-                "history":        history,
-            })
-            print(f"  FID={best_fid:.4f}  loss={best_loss:.4f}  ({elapsed/60:.1f} min)")
-        except Exception as e:
-            results.append({"run_name": run_name, "error": str(e)})
-            print(f"  BŁĄD: {e}")
-
-    results.sort(key=lambda r: r.get("best_fid", float("inf")))
-    _save_results(results, RESULTS_DIR / "results.json")
-    _print_ranking(results)
-    return results
-
-
-def load_best_model(results: List[Dict]) -> nn.Module:
-    best = results[0]
-    print(f"Najlepszy model: {best['run_name']}  FID={best['best_fid']}")
-    cfg = NetConfig(**{**BASE_CONFIG, **best["params"]})
-    net = ParametricUNet(cfg)
-    net.load_state_dict(torch.load(best["checkpoint"], map_location="cpu"))
-    return net.eval()
-
-
-def _make_run_name(idx: int, params: dict) -> str:
-    short = {"channel_sizes": "ch", "activation": "act",
-             "use_batchnorm": "bn", "lr": "lr", "optimizer_name": "opt"}
-    parts = [f"run{idx:03d}"] + [
-        f"{short.get(k, k)}={str(v).replace(' ', '').replace('[', '').replace(']', '').replace(',', '-')}"
-        for k, v in params.items()
-    ]
-    return "_".join(parts)
-
-
-def _save_results(results: List[Dict], path: Path):
-    serializable = [{k: v for k, v in r.items() if k != "history"} for r in results]
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(serializable, f, indent=2, ensure_ascii=False)
-
-
-def _print_ranking(results: List[Dict]):
-    print("\n" + "─" * 70)
-    print(f"  RANKING GRID SEARCH")
-    print("─" * 70)
-    for i, r in enumerate(results[:10], start=1):
-        if "error" in r:
-            print(f"  {i:>2}. {r['run_name']}  BŁĄD: {r['error']}")
-        else:
-            print(f"  {i:>2}. FID={r['best_fid']:>8.4f}  loss={r['best_loss']:.4f}  {r['run_name']}")
-    print("─" * 70)
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    full_dataset = read_dataset(NetConfig())
-
-    # --- Grid search ---
-    results    = run_grid_search(full_dataset)
-    best_model = load_best_model(results)
-
-    # --- Pełny trening na zwycięskiej konfiguracji ---
-    final_config = NetConfig(
-        channel_sizes=[32, 64, 128],
-        activation="gelu",
-        use_batchnorm=False,
-        epochs=100,
-        lr=3e-4,
-        optimizer_name="adamw",
-        loss_name="mse",
-        scheduler_name="cosine",
-        grad_clip=1.0,
-        eval_fid=True,
-        eval_every=5,
-        fid_n_generated=512,
-        fid_steps=40,
-        fid_evaluator_epochs=20,
-        save_best_by="fid",
-        save_path=OUTPUT_PATH,
-        log_every=1,
-        print_images=True,
-    )
-
-    print("\n--- Trening finalny (100 epok) ---")
-    experiment = DiffusionExperiment(final_config)
-    history    = experiment.fit(full_dataset)
-    print("--- Zakończono! ---")
+    main()
