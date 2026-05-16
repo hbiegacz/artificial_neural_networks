@@ -82,6 +82,70 @@ def pad_batch(
     padded_sequences = pad_sequence(sequences, batch_first=True, padding_value=0.0)
     return padded_sequences, torch.stack(labels), original_lengths
 
+
+@dataclass
+class NetConfig:
+    """Model and training settings in one place.
+
+    Fields:
+        input_size     — number of features per time step.
+        hidden_size    — hidden state size for LSTM.
+        num_layers     — number of LSTM layers.
+        dropout        — dropout between LSTM layers.
+        bidirectional  — use bidirectional LSTM.
+        lr             — learning rate for Adam.
+        epochs         — number of training epochs.
+        batch_size     — training batch size.
+    """
+
+    input_size: int = 0 
+    hidden_size: int = 64
+    num_layers: int = 2
+    dropout: float = 0.3
+    bidirectional: bool = False
+    lr: float = 1e-3
+    epochs: int = 100
+    batch_size: int = 32
+
+class LSTMModel(nn.Module):
+    """Defines the neural network architecture of the LSTM model."""
+
+    def __init__(self, config: NetConfig) -> None:
+        super().__init__()
+
+        self._num_directions = 2 if config.bidirectional else 1
+
+        self.lstm = nn.LSTM(
+            input_size=config.input_size,
+            hidden_size=config.hidden_size,
+            num_layers=config.num_layers,
+            dropout=config.dropout if config.num_layers > 1 else 0.0,
+            bidirectional=config.bidirectional,
+            batch_first=True,
+        )
+        self.dropout = nn.Dropout(config.dropout)
+        self.classifier = nn.Linear(config.hidden_size * self._num_directions, NUM_CLASSES)
+
+    def forward(self, padded_sequences: Tensor, original_lengths: list[int]) -> Tensor:
+        """Compute the model output for a batch of sequences. This method runs the input 
+        through the LSTM and turns the result into score values for each composer. """
+        
+        packed_input = pack_padded_sequence(
+            padded_sequences,
+            original_lengths,
+            batch_first=True,
+            enforce_sorted=False,
+        )
+        _, (hidden_state, _) = self.lstm(packed_input)
+
+        if self._num_directions == 2:
+            last_hidden = torch.cat([hidden_state[-2], hidden_state[-1]], dim=1)
+        else:
+            last_hidden = hidden_state[-1]
+
+        return self.classifier(self.dropout(last_hidden))
+
+
 if __name__ == "__main__":
 
     training_data = load_raw_data(TRAINING_DATA_PATH)
