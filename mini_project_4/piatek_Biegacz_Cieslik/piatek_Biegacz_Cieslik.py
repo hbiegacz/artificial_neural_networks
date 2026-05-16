@@ -21,8 +21,8 @@ class VAEConfig:
     image_size: int = 32
     input_channels: int = 3
     latent_dimension: int = 1024
-    num_classes: int = 43          
-    class_embedding_dim: int = 64  
+    num_classes: int = 43
+    class_embedding_dim: int = 64
     encoder_channels: List[int] = field(default_factory=lambda: [64, 64, 128])
     learning_rate: float = 1e-3
     batch_size: int = 32
@@ -46,7 +46,11 @@ class VAEConfig:
 
     def flattened_size(self) -> int:
         """Derives the latent projection size from the config, so architecture changes stay consistent."""
-        return self.encoder_channels[-1] * self.feature_map_size() * self.feature_map_size()
+        return (
+            self.encoder_channels[-1]
+            * self.feature_map_size()
+            * self.feature_map_size()
+        )
 
 
 class VariationalAutoencoder(nn.Module):
@@ -55,16 +59,26 @@ class VariationalAutoencoder(nn.Module):
         super().__init__()
         self.config = config
 
-        self.class_embedding = nn.Embedding(config.num_classes, config.class_embedding_dim)
+        self.class_embedding = nn.Embedding(
+            config.num_classes, config.class_embedding_dim
+        )
 
         encoder_layers = []
         current_channels = config.input_channels
         for output_channels in config.encoder_channels:
-            encoder_layers.extend([
-                nn.Conv2d(current_channels, output_channels, kernel_size=4, stride=2, padding=1),
-                nn.BatchNorm2d(output_channels),
-                nn.LeakyReLU(0.2, inplace=True),
-            ])
+            encoder_layers.extend(
+                [
+                    nn.Conv2d(
+                        current_channels,
+                        output_channels,
+                        kernel_size=4,
+                        stride=2,
+                        padding=1,
+                    ),
+                    nn.BatchNorm2d(output_channels),
+                    nn.LeakyReLU(0.2, inplace=True),
+                ]
+            )
             current_channels = output_channels
         self.encoder = nn.Sequential(*encoder_layers)
 
@@ -75,25 +89,45 @@ class VariationalAutoencoder(nn.Module):
         decoder_in_size = config.latent_dimension + config.class_embedding_dim
         self.from_latent = nn.Linear(decoder_in_size, config.flattened_size())
 
-        decoder_channels = list(reversed(config.encoder_channels[:-1])) + [config.input_channels]
+        decoder_channels = list(reversed(config.encoder_channels[:-1])) + [
+            config.input_channels
+        ]
         decoder_layers = []
         current_channels = config.encoder_channels[-1]
 
         for output_channels in decoder_channels[:-1]:
-            decoder_layers.extend([
-                nn.ConvTranspose2d(current_channels, output_channels, kernel_size=4, stride=2, padding=1),
-                nn.BatchNorm2d(output_channels),
-                nn.ReLU(inplace=True),
-            ])
+            decoder_layers.extend(
+                [
+                    nn.ConvTranspose2d(
+                        current_channels,
+                        output_channels,
+                        kernel_size=4,
+                        stride=2,
+                        padding=1,
+                    ),
+                    nn.BatchNorm2d(output_channels),
+                    nn.ReLU(inplace=True),
+                ]
+            )
             current_channels = output_channels
 
-        decoder_layers.extend([
-            nn.ConvTranspose2d(current_channels, decoder_channels[-1], kernel_size=4, stride=2, padding=1),
-            nn.Tanh(),
-        ])
+        decoder_layers.extend(
+            [
+                nn.ConvTranspose2d(
+                    current_channels,
+                    decoder_channels[-1],
+                    kernel_size=4,
+                    stride=2,
+                    padding=1,
+                ),
+                nn.Tanh(),
+            ]
+        )
         self.decoder = nn.Sequential(*decoder_layers)
 
-    def encode(self, images: torch.Tensor, class_labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def encode(
+        self, images: torch.Tensor, class_labels: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Changes input images and labels into mean and variance for the latent space."""
         features = self.encoder(images)
         features = features.view(images.size(0), -1)
@@ -101,13 +135,17 @@ class VariationalAutoencoder(nn.Module):
         features = torch.cat([features, class_emb], dim=1)
         return self.to_mean(features), self.to_log_variance(features)
 
-    def sample_latent(self, mean: torch.Tensor, log_variance: torch.Tensor) -> torch.Tensor:
+    def sample_latent(
+        self, mean: torch.Tensor, log_variance: torch.Tensor
+    ) -> torch.Tensor:
         """Samples a random vector using the mean and variance."""
         std = torch.exp(0.5 * log_variance)
         noise = torch.randn_like(std)
         return mean + noise * std
 
-    def decode(self, latent_vectors: torch.Tensor, class_labels: torch.Tensor) -> torch.Tensor:
+    def decode(
+        self, latent_vectors: torch.Tensor, class_labels: torch.Tensor
+    ) -> torch.Tensor:
         """Turns the latent vectors and class labels back into images."""
         class_emb = self.class_embedding(class_labels)
         z = torch.cat([latent_vectors, class_emb], dim=1)
@@ -120,7 +158,9 @@ class VariationalAutoencoder(nn.Module):
         )
         return self.decoder(features)
 
-    def forward(self, images: torch.Tensor, class_labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self, images: torch.Tensor, class_labels: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Does a full pass: encodes images, samples a vector, and decodes it back."""
         mean, log_variance = self.encode(images, class_labels)
         latent_vectors = self.sample_latent(mean, log_variance)
@@ -136,9 +176,7 @@ class VAEExperiment:
         self.model = VariationalAutoencoder(config).to(self.device)
         self.optimizer = self.create_optimizer()
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=config.epochs,
-            eta_min=1e-5
+            self.optimizer, T_max=config.epochs, eta_min=1e-5
         )
 
     def create_optimizer(self):
@@ -173,7 +211,9 @@ class VAEExperiment:
         )
 
         warmup_epochs = self.config.epochs // 2
-        annealed_kl_weight = min(1.0, current_epoch / max(1, warmup_epochs)) * self.config.kl_weight
+        annealed_kl_weight = (
+            min(1.0, current_epoch / max(1, warmup_epochs)) * self.config.kl_weight
+        )
 
         total_loss = reconstruction_loss + annealed_kl_weight * kl_divergence
 
@@ -186,15 +226,21 @@ class VAEExperiment:
     def train_epoch(self, data_loader: DataLoader, epoch: int) -> Dict[str, float]:
         """Runs one training step over all data and returns the average loss."""
         self.model.train()
-        metrics_sum = {"total_loss": 0.0, "reconstruction_loss": 0.0, "kl_divergence": 0.0}
+        metrics_sum = {
+            "total_loss": 0.0,
+            "reconstruction_loss": 0.0,
+            "kl_divergence": 0.0,
+        }
 
-        for images, class_labels in data_loader:          
+        for images, class_labels in data_loader:
             images = images.to(self.device)
-            class_labels = class_labels.to(self.device)   
+            class_labels = class_labels.to(self.device)
             self.optimizer.zero_grad()
 
-            reconstructed_images, mean, log_variance = self.model(images, class_labels)  
-            loss, metrics = self.compute_loss(images, reconstructed_images, mean, log_variance, epoch)
+            reconstructed_images, mean, log_variance = self.model(images, class_labels)
+            loss, metrics = self.compute_loss(
+                images, reconstructed_images, mean, log_variance, epoch
+            )
 
             loss.backward()
             self.optimizer.step()
@@ -210,7 +256,7 @@ class VAEExperiment:
         history = []
 
         for epoch in range(self.config.epochs):
-            epoch_metrics = self.train_epoch(data_loader, epoch)  
+            epoch_metrics = self.train_epoch(data_loader, epoch)
             self.scheduler.step()
             history.append(epoch_metrics)
 
@@ -228,20 +274,27 @@ class VAEExperiment:
         """Generates new images from random noise and random class labels."""
         self.model.eval()
         with torch.no_grad():
-            latent_vectors = torch.randn(number_of_samples, self.config.latent_dimension, device=self.device)
-            class_labels = torch.arange(number_of_samples, device=self.device) % self.config.num_classes
+            latent_vectors = torch.randn(
+                number_of_samples, self.config.latent_dimension, device=self.device
+            )
+            class_labels = (
+                torch.arange(number_of_samples, device=self.device)
+                % self.config.num_classes
+            )
             generated_images = self.model.decode(latent_vectors, class_labels)
         return generated_images
 
 
 def create_transforms(config: VAEConfig):
     """Sets up image changes like resize and color tweaks."""
-    return transforms.Compose([
-        transforms.Resize((config.image_size, config.image_size)),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),  
-        transforms.ToTensor(),
-        transforms.Normalize(mean=config.mean, std=config.std),
-    ])
+    return transforms.Compose(
+        [
+            transforms.Resize((config.image_size, config.image_size)),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=config.mean, std=config.std),
+        ]
+    )
 
 
 def read_train_dataset(config: VAEConfig):
@@ -274,6 +327,7 @@ def denormalize_images(images: torch.Tensor, config: VAEConfig) -> torch.Tensor:
 def save_generated_samples(images: torch.Tensor, output_path: str):
     """Saves the generated images to a file."""
     torch.save(images.cpu().detach(), output_path)
+
 
 def main():
     """Runs the whole process: loads data, trains the model, and saves new images."""
