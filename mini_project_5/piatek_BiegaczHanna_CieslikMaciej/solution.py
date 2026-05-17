@@ -4,11 +4,12 @@ Load data, inspect the dataset, and prepare training utilities for the model.
 
 import pickle
 from collections import Counter
-import torch 
-import torch.nn as nn
-from torch import Tensor
-from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence
+import torch # pyright: ignore[reportMissingImports]
+import torch.nn as nn # pyright: ignore[reportMissingImports]
+import numpy as np # pyright: ignore[reportMissingImports]
+from torch import Tensor # pyright: ignore[reportMissingImports]
+from torch.utils.data import Dataset, DataLoader # pyright: ignore[reportMissingImports]
+from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence # pyright: ignore[reportMissingImports]
 from dataclasses import dataclass
 
 
@@ -25,11 +26,10 @@ COMPOSER_LABELS = {
 NUM_CLASSES = len(COMPOSER_LABELS)
 
 
-
 def load_raw_data(pickle_path: str) -> list[tuple[torch.Tensor, int]]:
-    """Load training data from a pickle file. 
+    """Load training data from a pickle file.
     Returns a list of (sequence_tensor, class_label) tuples.
-    Each sequence_tensor has shape (sequence_length, input_features). """
+    Each sequence_tensor has shape (sequence_length, input_features)."""
     with open(pickle_path, "rb") as pickle_file:
         raw_data = pickle.load(pickle_file)
     return raw_data
@@ -38,7 +38,7 @@ def load_raw_data(pickle_path: str) -> list[tuple[torch.Tensor, int]]:
 def inspect_dataset(data: list[tuple[torch.Tensor, int]]) -> None:
     """Print basic dataset statistics."""
     first_sequence, first_label = data[0]
-    input_size = first_sequence.shape[-1]
+    input_size = first_sequence.shape[-1] if first_sequence.ndim == 2 else 1
 
     sequence_lengths = [seq.shape[0] for seq, _ in data]
     labels = [label for _, label in data]
@@ -58,7 +58,7 @@ def inspect_dataset(data: list[tuple[torch.Tensor, int]]) -> None:
 
 class ChordDataset(Dataset):
     """Make raw examples available for PyTorch training.
-    This class stores data so the DataLoader can load each example. """
+    This class stores data so the DataLoader can load each example."""
 
     def __init__(self, data: list[tuple[Tensor, int]]) -> None:
         self.data = data
@@ -69,14 +69,14 @@ class ChordDataset(Dataset):
     def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
         sequence, label = self.data[index]
         tensor_sequence = torch.as_tensor(sequence, dtype=torch.float32)
+        if tensor_sequence.ndim == 1:
+            tensor_sequence = tensor_sequence.unsqueeze(-1)
         return tensor_sequence, torch.tensor(label, dtype=torch.long)
 
 
-def pad_batch(
-    batch: list[tuple[Tensor, Tensor]]
-) -> tuple[Tensor, Tensor, list[int]]:
+def pad_batch(batch: list[tuple[Tensor, Tensor]]) -> tuple[Tensor, Tensor, list[int]]:
     """Pad all sequences to the same length with zeros.
-    Returns padded_sequences, labels, original_lengths """
+    Returns padded_sequences, labels, original_lengths"""
     sequences, labels = zip(*batch)
     original_lengths = [seq.shape[0] for seq in sequences]
     padded_sequences = pad_sequence(sequences, batch_first=True, padding_value=0.0)
@@ -98,7 +98,7 @@ class NetConfig:
         batch_size     — training batch size.
     """
 
-    input_size: int = 0 
+    input_size: int = 0
     hidden_size: int = 64
     num_layers: int = 2
     dropout: float = 0.3
@@ -106,6 +106,7 @@ class NetConfig:
     lr: float = 1e-3
     epochs: int = 100
     batch_size: int = 32
+
 
 class LSTMModel(nn.Module):
     """Defines the neural network architecture of the LSTM model."""
@@ -124,12 +125,14 @@ class LSTMModel(nn.Module):
             batch_first=True,
         )
         self.dropout = nn.Dropout(config.dropout)
-        self.classifier = nn.Linear(config.hidden_size * self._num_directions, NUM_CLASSES)
+        self.classifier = nn.Linear(
+            config.hidden_size * self._num_directions, NUM_CLASSES
+        )
 
     def forward(self, padded_sequences: Tensor, original_lengths: list[int]) -> Tensor:
-        """Compute the model output for a batch of sequences. This method runs the input 
-        through the LSTM and turns the result into score values for each composer. """
-        
+        """Compute the model output for a batch of sequences. This method runs the input
+        through the LSTM and turns the result into score values for each composer."""
+
         packed_input = pack_padded_sequence(
             padded_sequences,
             original_lengths,
@@ -146,12 +149,71 @@ class LSTMModel(nn.Module):
         return self.classifier(self.dropout(last_hidden))
 
 
+class LSTMTrainer:
+    """Manages the training and prediction process of the LSTM model.
+    This class initializes the model, runs the training loop, and makes predictions."""
+
+    def __init__(self, config: NetConfig) -> None:
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model: LSTMModel | None = None
+
+    def fit(
+        self, training_data: list, class_weights: torch.Tensor | None = None
+    ) -> "LSTMTrainer":
+        first_sequence = training_data[0][0]
+        self.config.input_size = first_sequence.shape[-1] if first_sequence.ndim == 2 else 1
+        self.model = LSTMModel(self.config).to(self.device)
+        assert self.model is not None
+
+        loader = DataLoader(
+            ChordDataset(training_data),
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            collate_fn=pad_batch,
+        )
+        criterion = nn.CrossEntropyLoss(
+            weight=class_weights.to(self.device) if class_weights is not None else None
+        )
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.config.lr)
+
+        self.model.train()
+        for _ in range(self.config.epochs):
+            for padded_sequences, labels, original_lengths in loader:
+                padded_sequences, labels = padded_sequences.to(self.device), labels.to(
+                    self.device
+                )
+                optimizer.zero_grad()
+                criterion(
+                    self.model(padded_sequences, original_lengths), labels
+                ).backward()
+                optimizer.step()
+
+        return self
+
+    def predict(self, data: list) -> np.ndarray:
+        assert self.model is not None, "Call fit() first."
+        loader = DataLoader(
+            ChordDataset(data),
+            batch_size=self.config.batch_size,
+            shuffle=False,
+            collate_fn=pad_batch,
+        )
+
+        all_predictions: list[torch.Tensor] = []
+        self.model.eval()
+        with torch.no_grad():
+            for padded_sequences, _, original_lengths in loader:
+                logits = self.model(padded_sequences.to(self.device), original_lengths)
+                all_predictions.append(logits.argmax(dim=1).cpu())
+
+        return torch.cat(all_predictions).numpy()
+
+
 if __name__ == "__main__":
 
     training_data = load_raw_data(TRAINING_DATA_PATH)
     inspect_dataset(training_data)
 
     dataset = ChordDataset(training_data)
-    loader = DataLoader(
-        dataset, batch_size=4, shuffle=True, collate_fn=pad_batch
-    )
+    loader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=pad_batch)
