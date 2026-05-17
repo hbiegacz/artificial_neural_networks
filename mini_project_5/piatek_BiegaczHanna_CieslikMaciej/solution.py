@@ -4,18 +4,20 @@ Load data, inspect the dataset, and prepare training utilities for the model.
 
 import pickle
 from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+
 import torch # pyright: ignore[reportMissingImports]
 import torch.nn as nn # pyright: ignore[reportMissingImports]
 import numpy as np # pyright: ignore[reportMissingImports]
 from torch import Tensor # pyright: ignore[reportMissingImports]
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler # pyright: ignore[reportMissingImports]
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence # pyright: ignore[reportMissingImports]
-from dataclasses import dataclass
 
 
 TRAINING_DATA_PATH = "../train.pkl"
-TESTING_DATA_PATH = "../test.pkl"
-PREDICTION_OUTPUT_PATH = "../pred.csv"
+TESTING_DATA_PATH = "../test_no_target.pkl"
+PREDICTION_OUTPUT_PATH = "pred.csv"
 COMPOSER_LABELS = {
     0: "bach",
     1: "beethoven",
@@ -27,9 +29,7 @@ NUM_CLASSES = len(COMPOSER_LABELS)
 
 
 def load_raw_data(pickle_path: str) -> list[tuple[torch.Tensor, int]]:
-    """Load training data from a pickle file.
-    Returns a list of (sequence_tensor, class_label) tuples.
-    Each sequence_tensor has shape (sequence_length, input_features)."""
+    """Load training data from a pickle file."""
     with open(pickle_path, "rb") as pickle_file:
         raw_data = pickle.load(pickle_file)
     return raw_data
@@ -67,7 +67,11 @@ class ChordDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
-        sequence, label = self.data[index]
+        data_item = self.data[index]
+        if isinstance(data_item, tuple) and len(data_item) == 2:
+            sequence, label = data_item
+        else:
+            sequence, label = data_item, -1
         tensor_sequence = torch.as_tensor(sequence, dtype=torch.float32)
         if tensor_sequence.ndim == 1:
             tensor_sequence = tensor_sequence.unsqueeze(-1)
@@ -110,7 +114,7 @@ class NetConfig:
     hidden_size: int = 64
     num_layers: int = 2
     dropout: float = 0.3
-    bidirectional: bool = False
+    bidirectional: bool = True
     lr: float = 1e-3
     epochs: int = 100
     batch_size: int = 32
@@ -122,46 +126,65 @@ class NetConfig:
     scheduler_step_size: int = 10
     scheduler_gamma: float = 0.1
     scheduler_patience: int = 5
+    early_stopping: bool = True
+    early_stopping_patience: int = 10
+    early_stopping_delta: float = 1e-4
+    early_stopping_min_epochs: int = 1
 
 
-class LSTMModel(nn.Module):
-    """Defines the neural network architecture of the LSTM model."""
+class LSTM(nn.Module):
+    """The class responsible for training the model and making composer predictions."""
 
     def __init__(self, config: NetConfig) -> None:
         super().__init__()
-
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._num_directions = 2 if config.bidirectional else 1
+        self._built = False
 
+        self.lstm: nn.LSTM | None = None
+        self.dropout: nn.Dropout | None = None
+        self.attention: nn.Sequential | None = None
+        self.batch_norm: nn.BatchNorm1d | None = None
+        self.classifier: nn.Linear | None = None
+
+        if config.input_size > 0:
+            self._build_network()
+
+    def _build_network(self) -> None:
+        self._num_directions = 2 if self.config.bidirectional else 1
         self.lstm = nn.LSTM(
-            input_size=config.input_size,
-            hidden_size=config.hidden_size,
-            num_layers=config.num_layers,
-            dropout=config.dropout if config.num_layers > 1 else 0.0,
-            bidirectional=config.bidirectional,
+            input_size=self.config.input_size,
+            hidden_size=self.config.hidden_size,
+            num_layers=self.config.num_layers,
+            dropout=self.config.dropout if self.config.num_layers > 1 else 0.0,
+            bidirectional=self.config.bidirectional,
             batch_first=True,
         )
-        self.dropout = nn.Dropout(config.dropout)
+        self.dropout = nn.Dropout(self.config.dropout)
         self.attention = (
             nn.Sequential(
-                nn.Linear(config.hidden_size * self._num_directions, config.hidden_size * self._num_directions),
+                nn.Linear(self.config.hidden_size * self._num_directions, self.config.hidden_size * self._num_directions),
                 nn.Tanh(),
-                nn.Linear(config.hidden_size * self._num_directions, 1),
+                nn.Linear(self.config.hidden_size * self._num_directions, 1),
             )
-            if config.attention
+            if self.config.attention
             else None
         )
         self.batch_norm = (
-            nn.BatchNorm1d(config.hidden_size * self._num_directions)
-            if config.use_batch_norm
+            nn.BatchNorm1d(self.config.hidden_size * self._num_directions)
+            if self.config.use_batch_norm
             else None
         )
         self.classifier = nn.Linear(
-            config.hidden_size * self._num_directions, NUM_CLASSES
+            self.config.hidden_size * self._num_directions, NUM_CLASSES
         )
+        self._built = True
+        self.to(self.device)
 
     def forward(self, padded_sequences: Tensor, original_lengths: list[int]) -> Tensor:
-        """Compute the model output for a batch of sequences. This method runs the input
-        through the LSTM and turns the result into score values for each composer."""
+        if not self._built:
+            raise RuntimeError("LSTM network is not built. Call fit() after setting input_size.")
 
         packed_input = pack_padded_sequence(
             padded_sequences,
@@ -169,7 +192,7 @@ class LSTMModel(nn.Module):
             batch_first=True,
             enforce_sorted=False,
         )
-        packed_output, (hidden_state, _) = self.lstm(packed_input)
+        packed_output, (hidden_state, _) = self.lstm(packed_input)  # type: ignore[attr-defined]
 
         if self.attention is not None:
             output, _ = pad_packed_sequence(packed_output, batch_first=True)
@@ -188,17 +211,7 @@ class LSTMModel(nn.Module):
         if self.batch_norm is not None:
             last_hidden = self.batch_norm(last_hidden)
 
-        return self.classifier(self.dropout(last_hidden))
-
-
-class LSTMTrainer:
-    """Manages the training and prediction process of the LSTM model.
-    This class initializes the model, runs the training loop, and makes predictions."""
-
-    def __init__(self, config: NetConfig) -> None:
-        self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model: LSTMModel | None = None
+        return self.classifier(self.dropout(last_hidden))  # type: ignore[return-value]
 
     def _compute_class_counts(self, training_data: list) -> Counter:
         return Counter(label for _, label in training_data)
@@ -226,13 +239,35 @@ class LSTMTrainer:
 
         raise ValueError(f"Unknown balance strategy: {self.config.balance_strategy}")
 
+    def _evaluate_loss(self, loader: DataLoader, criterion: nn.Module) -> float:
+        self.eval()
+        total_loss = 0.0
+        batch_count = 0
+        with torch.no_grad():
+            for padded_sequences, labels, original_lengths in loader:
+                padded_sequences, labels = padded_sequences.to(self.device), labels.to(self.device)
+                loss = criterion(self(padded_sequences, original_lengths), labels)
+                total_loss += float(loss)
+                batch_count += 1
+        self.train()
+        return total_loss / batch_count if batch_count else total_loss
+
     def fit(
-        self, training_data: list, class_weights: torch.Tensor | None = None
-    ) -> "LSTMTrainer":
+        self,
+        training_data: list,
+        class_weights: torch.Tensor | None = None,
+        validation_data: list | None = None,
+        early_stopping: bool | None = None,
+        early_stopping_patience: int | None = None,
+        early_stopping_delta: float | None = None,
+        early_stopping_min_epochs: int | None = None,
+    ) -> "LSTM":
         first_sequence = training_data[0][0]
         self.config.input_size = first_sequence.shape[-1] if first_sequence.ndim == 2 else 1
-        self.model = LSTMModel(self.config).to(self.device)
-        assert self.model is not None
+        if not self._built:
+            self._build_network()
+        else:
+            self.to(self.device)
 
         sampler = self._build_sampler(training_data)
         loader = DataLoader(
@@ -243,6 +278,15 @@ class LSTMTrainer:
             collate_fn=pad_batch,
         )
 
+        validation_loader = None
+        if validation_data is not None:
+            validation_loader = DataLoader(
+                ChordDataset(validation_data),
+                batch_size=self.config.batch_size,
+                shuffle=False,
+                collate_fn=pad_batch,
+            )
+
         effective_weights = class_weights
         if effective_weights is None and self.config.use_class_weights:
             effective_weights = self._compute_class_weights(training_data)
@@ -250,7 +294,7 @@ class LSTMTrainer:
         criterion = nn.CrossEntropyLoss(
             weight=effective_weights.to(self.device) if effective_weights is not None else None
         )
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.config.lr)
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.config.lr)
 
         scheduler = None
         if self.config.scheduler_type == "step":
@@ -271,36 +315,64 @@ class LSTMTrainer:
                 factor=self.config.scheduler_gamma,
             )
 
-        self.model.train()
+        use_early_stopping = self.config.early_stopping if early_stopping is None else early_stopping
+        patience = self.config.early_stopping_patience if early_stopping_patience is None else early_stopping_patience
+        min_delta = self.config.early_stopping_delta if early_stopping_delta is None else early_stopping_delta
+        min_epochs = self.config.early_stopping_min_epochs if early_stopping_min_epochs is None else early_stopping_min_epochs
+
+        best_loss = float("inf")
+        best_state = None
+        epochs_without_improvement = 0
+
+        self.train()
         for epoch in range(self.config.epochs):
             epoch_loss = 0.0
             batch_count = 0
 
             for padded_sequences, labels, original_lengths in loader:
-                padded_sequences, labels = padded_sequences.to(self.device), labels.to(
-                    self.device
-                )
+                padded_sequences, labels = padded_sequences.to(self.device), labels.to(self.device)
                 optimizer.zero_grad()
-                loss = criterion(
-                    self.model(padded_sequences, original_lengths), labels
-                )
+                loss = criterion(self(padded_sequences, original_lengths), labels)
                 loss.backward()
                 optimizer.step()
 
                 epoch_loss += float(loss)
                 batch_count += 1
 
+            average_loss = epoch_loss / batch_count if batch_count else epoch_loss
+            monitor_loss = average_loss
+            if validation_loader is not None:
+                validation_loss = self._evaluate_loss(validation_loader, criterion)
+                monitor_loss = validation_loss
+
             if scheduler is not None:
                 if self.config.scheduler_type == "plateau":
-                    average_loss = epoch_loss / batch_count if batch_count else epoch_loss
-                    scheduler.step(average_loss)
+                    scheduler.step(monitor_loss)
                 else:
                     scheduler.step()
+
+            if use_early_stopping:
+                if monitor_loss + min_delta < best_loss:
+                    best_loss = monitor_loss
+                    best_state = {name: param.detach().cpu().clone() for name, param in self.state_dict().items()}
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+
+                if epoch + 1 >= min_epochs and epochs_without_improvement >= patience:
+                    print(
+                        f"Early stopping at epoch {epoch + 1}. "
+                        f"Best loss {best_loss:.6f}, "
+                        f"no improvement for {epochs_without_improvement} epochs."
+                    )
+                    break
+
+        if use_early_stopping and best_state is not None:
+            self.load_state_dict(best_state)
 
         return self
 
     def predict(self, data: list) -> np.ndarray:
-        assert self.model is not None, "Call fit() first."
         loader = DataLoader(
             ChordDataset(data),
             batch_size=self.config.batch_size,
@@ -309,19 +381,40 @@ class LSTMTrainer:
         )
 
         all_predictions: list[torch.Tensor] = []
-        self.model.eval()
+        self.eval()
         with torch.no_grad():
             for padded_sequences, _, original_lengths in loader:
-                logits = self.model(padded_sequences.to(self.device), original_lengths)
+                logits = self(padded_sequences.to(self.device), original_lengths)
                 all_predictions.append(logits.argmax(dim=1).cpu())
 
         return torch.cat(all_predictions).numpy()
 
+LSTMTrainer = LSTM #necesary to make sure that the notebook code works, since it uses the old class LSTMTrainer
+
+
+def get_script_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def save_predictions(predictions: np.ndarray, output_path: Path) -> None:
+    np.savetxt(output_path, predictions, fmt="%d", delimiter="\n")
+
+
 
 if __name__ == "__main__":
+    base_dir = get_script_dir()
+    training_path = base_dir / TRAINING_DATA_PATH
+    testing_path = base_dir / TESTING_DATA_PATH
+    output_path = base_dir / PREDICTION_OUTPUT_PATH
 
-    training_data = load_raw_data(TRAINING_DATA_PATH)
+    training_data = load_raw_data(str(training_path))
     inspect_dataset(training_data)
 
-    dataset = ChordDataset(training_data)
-    loader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=pad_batch)
+    # TODO: create the best config found during experimentation and use it here!!!
+    model = LSTM(NetConfig())
+    model.fit(training_data)
+
+    test_data = load_raw_data(str(testing_path))
+    save_predictions(model.predict(test_data), output_path)
+
+    print(f"Saved predictions to {output_path}")
