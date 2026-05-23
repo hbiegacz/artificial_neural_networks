@@ -410,8 +410,9 @@ if __name__ == "__main__":
     training_data = load_raw_data(str(training_path))
     inspect_dataset(training_data)
 
-    # TODO: create the best config found during experimentation and use it here!!!
-    model = LSTM(NetConfig())
+    model = LSTM(NetConfig( hidden_size=512, num_layers=2, dropout=0.3, epochs=100, bidirectional=False, batch_size=32, balance_strategy="oversample", 
+        attention=False, scheduler_type=None))
+    print("Start")
     model.fit(training_data)
 
     test_data = load_raw_data(str(testing_path))
