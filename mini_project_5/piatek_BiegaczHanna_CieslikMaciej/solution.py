@@ -410,8 +410,8 @@ if __name__ == "__main__":
     training_data = load_raw_data(str(training_path))
     inspect_dataset(training_data)
 
-    model = LSTM(NetConfig( hidden_size=512, num_layers=2, dropout=0.3, epochs=100, bidirectional=False, batch_size=32, balance_strategy="oversample", 
-        attention=False, scheduler_type=None))
+    model = LSTM(NetConfig( hidden_size=1024, num_layers=2, dropout=0.3, epochs=15, bidirectional=False, batch_size=32, balance_strategy="oversample", attention=False))
+
     print("Start")
     model.fit(training_data)
 
